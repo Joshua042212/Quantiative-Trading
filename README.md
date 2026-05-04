@@ -1,12 +1,7 @@
 # 台股資料爬蟲與視覺化專案
 
-這個專案整合了前端儀表板、後端 API 與台股資料爬蟲流程，適合用來管理 K 線、月營收、新聞與公司基本資料。
+這個專案整合了前端儀表板、後端 API 與台股資料爬蟲流程，用來管理 K 線、月營收、新聞與公司基本資料。
 
-## GitHub 上傳前提醒
-
-- 機密設定請放在 `.env`
-- 依賴套件請使用 `requirements.txt`
-- 本機環境與建置產物已由 `.gitignore` 排除
 
 
 Currently, two official plugins are available:
