@@ -18,10 +18,14 @@ interface KlineApiItem {
   low: number;
   close: number;
   volume: number;
+  sma_2: number | null;
   sma_5: number | null;
   sma_10: number | null;
   sma_20: number | null;
+  sma_30: number | null;
   sma_60: number | null;
+  sma_120: number | null;
+  sma_240: number | null;
   bb_upper: number | null;
   bb_lower: number | null;
   bb_percent_b: number | null;
@@ -30,15 +34,14 @@ interface KlineApiItem {
 }
 
 type IndicatorState = {
-  ma5: boolean;
-  ma10: boolean;
-  ma20: boolean;
-  ma60: boolean;
+  ma1: boolean;
+  ma2: boolean;
+  ma3: boolean;
   bollinger: boolean;
   sar: boolean;
 };
 
-type IndicatorSeriesKey = 'ma5' | 'ma10' | 'ma20' | 'ma60' | 'bbUpper' | 'bbLower' | 'sar';
+type IndicatorSeriesKey = 'ma1' | 'ma2' | 'ma3' | 'bbUpper' | 'bbLower' | 'sar';
 
 type IndicatorParamState = {
   bbLength: number;
@@ -47,15 +50,18 @@ type IndicatorParamState = {
   sarMax: number;
 };
 
+const MA_COLORS: [string, string, string] = ['#FFD166', '#06D6A0', '#118AB2'];
+const MA_PERIOD_OPTIONS: number[] = [2, 5, 10, 20, 30, 60, 120, 240];
+
 const TradingChart: React.FC<TradingChartProps> = ({ ticker }) => {
   const [indicatorState, setIndicatorState] = useState<IndicatorState>({
-    ma5: true,
-    ma10: false,
-    ma20: true,
-    ma60: false,
+    ma1: true,
+    ma2: true,
+    ma3: true,
     bollinger: false,
     sar: false,
   });
+  const [maPeriods, setMaPeriods] = useState<[number, number, number]>([5, 20, 60]);
   const [indicatorParams, setIndicatorParams] = useState<IndicatorParamState>({
     bbLength: 20,
     bbStd: 2,
@@ -133,29 +139,13 @@ const TradingChart: React.FC<TradingChartProps> = ({ ticker }) => {
   const syncIndicatorSeries = () => {
     if (!chartRef.current) return;
 
-    if (indicatorState.ma5) {
-      upsertLineSeries('ma5', '#FFD166', 'sma_5');
-    } else {
-      removeIndicatorSeries('ma5');
-    }
-
-    if (indicatorState.ma10) {
-      upsertLineSeries('ma10', '#EF476F', 'sma_10');
-    } else {
-      removeIndicatorSeries('ma10');
-    }
-
-    if (indicatorState.ma20) {
-      upsertLineSeries('ma20', '#06D6A0', 'sma_20');
-    } else {
-      removeIndicatorSeries('ma20');
-    }
-
-    if (indicatorState.ma60) {
-      upsertLineSeries('ma60', '#118AB2', 'sma_60');
-    } else {
-      removeIndicatorSeries('ma60');
-    }
+    (['ma1', 'ma2', 'ma3'] as const).forEach((key, idx) => {
+      if (indicatorState[key]) {
+        upsertLineSeries(key, MA_COLORS[idx], `sma_${maPeriods[idx]}` as keyof KlineApiItem);
+      } else {
+        removeIndicatorSeries(key);
+      }
+    });
 
     if (indicatorState.bollinger) {
       upsertLineSeries('bbUpper', '#F4A261', 'bb_upper', 2);
@@ -185,6 +175,14 @@ const TradingChart: React.FC<TradingChartProps> = ({ ticker }) => {
       ...prev,
       [key]: Number.isFinite(parsedValue) ? parsedValue : prev[key],
     }));
+  };
+
+  const onMaPeriodChange = (idx: 0 | 1 | 2, raw: string) => {
+    const parsed = Number(raw);
+    if (!MA_PERIOD_OPTIONS.includes(parsed)) return;
+    const newPeriods = [...maPeriods] as [number, number, number];
+    newPeriods[idx] = parsed;
+    setMaPeriods(newPeriods);
   };
 
   const timeToKey = (timeValue: unknown): string | null => {
@@ -365,9 +363,9 @@ const TradingChart: React.FC<TradingChartProps> = ({ ticker }) => {
   ]);
 
   useEffect(() => {
-    // 勾選狀態變更時即時同步圖上指標，並用 removeSeries 清掉未勾選的線。
+    // 勾選狀態或均線週期變更時即時同步圖上指標（不需重新 fetch，資料已在 latestDataRef 中）。
     syncIndicatorSeries();
-  }, [indicatorState]);
+  }, [indicatorState, maPeriods]);
 
   return (
     <div style={{ width: '100%' }}>
@@ -428,22 +426,34 @@ const TradingChart: React.FC<TradingChartProps> = ({ ticker }) => {
           />
           SAR Max
         </label>
-        <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
-          <input type="checkbox" checked={indicatorState.ma5} onChange={() => toggleIndicator('ma5')} />
-          MA5
-        </label>
-        <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
-          <input type="checkbox" checked={indicatorState.ma10} onChange={() => toggleIndicator('ma10')} />
-          MA10
-        </label>
-        <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
-          <input type="checkbox" checked={indicatorState.ma20} onChange={() => toggleIndicator('ma20')} />
-          MA20
-        </label>
-        <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
-          <input type="checkbox" checked={indicatorState.ma60} onChange={() => toggleIndicator('ma60')} />
-          MA60
-        </label>
+        {(['ma1', 'ma2', 'ma3'] as const).map((key, idx) => (
+          <label key={key} style={{ display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={indicatorState[key]}
+              onChange={() => toggleIndicator(key)}
+            />
+            <span style={{ color: MA_COLORS[idx], fontWeight: 700, minWidth: '20px' }}>均</span>
+            <select
+              value={String(maPeriods[idx])}
+              onChange={(e) => onMaPeriodChange(idx as 0 | 1 | 2, e.target.value)}
+              style={{
+                width: '62px',
+                padding: '2px 4px',
+                backgroundColor: '#1E222D',
+                border: '1px solid #3A3B4E',
+                borderRadius: '3px',
+                color: '#D9D9D9',
+              }}
+            >
+              {MA_PERIOD_OPTIONS.map((period) => (
+                <option key={period} value={period}>
+                  {period}
+                </option>
+              ))}
+            </select>
+          </label>
+        ))}
         <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
           <input
             type="checkbox"

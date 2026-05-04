@@ -1,0 +1,2 @@
+0050.TW in raw_kline_yfinance: (2997, datetime.date(2014, 1, 2), datetime.date(2026, 4, 27))
+ETF tickers in raw_kline_yfinance: (223,)

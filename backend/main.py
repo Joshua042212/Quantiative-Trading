@@ -1,4 +1,4 @@
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from io import StringIO
 import re
 
@@ -14,10 +14,10 @@ from sqlalchemy.orm import Session
 
 try:
     from .database import Base, engine, get_db
-    from .models import CrawlLog, EtfPremiumDiscount, MonthlyRevenue, NewsArticle, StockKline
+    from .models import CrawlLog, EtfPremiumDiscount, MonthlyRevenue, NewsArticle, RawKlineYFinance, StockKline
 except ImportError:
     from database import Base, engine, get_db
-    from models import CrawlLog, EtfPremiumDiscount, MonthlyRevenue, NewsArticle, StockKline
+    from models import CrawlLog, EtfPremiumDiscount, MonthlyRevenue, NewsArticle, RawKlineYFinance, StockKline
 
 try:
     import pandas_ta as ta  # type: ignore[import-not-found]
@@ -105,6 +105,53 @@ def to_chart_payload(row: StockKline):
     }
 
 
+def is_etf_ticker(ticker: str) -> bool:
+    """判斷是否為 ETF/ETN：代號以 00 開頭，或末碼為英文字母。"""
+    import re as _re
+    code = ticker.strip().upper().split(".", 1)[0]
+    return code.startswith("00") or bool(_re.search(r"[A-Z]$", code))
+
+
+def to_chart_payload_from_yf(row: RawKlineYFinance) -> dict:
+    """將 raw_kline_yfinance ORM 列轉成圖表 payload。
+
+    非 ETF 股票具有 adj_close，用以回推所有 adj OHLC 欄位，
+    使長期 K 線在除權息後仍保持連續。
+    """
+    close = row.close or 0.0
+    adj_close = row.adj_close
+    if close and adj_close is not None:
+        factor = adj_close / close
+    else:
+        factor = 1.0
+        adj_close = row.close
+
+    open_ = row.open or 0.0
+    high = row.high or 0.0
+    low = row.low or 0.0
+
+    return {
+        "time": row.date.strftime("%Y-%m-%d"),
+        "open": round(open_ * factor, 4),
+        "high": round(high * factor, 4),
+        "low": round(low * factor, 4),
+        "close": round(close * factor, 4),
+        "adj_open": round(open_ * factor, 4),
+        "adj_high": round(high * factor, 4),
+        "adj_low": round(low * factor, 4),
+        "adj_close": round(adj_close, 4) if adj_close is not None else None,
+        "volume": row.volume,
+        "sma_2": row.sma_2,
+        "sma_5": row.sma_5,
+        "sma_10": row.sma_10,
+        "sma_20": row.sma_20,
+        "sma_30": row.sma_30,
+        "sma_60": row.sma_60,
+        "sma_120": row.sma_120,
+        "sma_240": row.sma_240,
+    }
+
+
 def normalize_ticker_symbol(ticker: str) -> str:
     return ticker.strip().upper()
 
@@ -179,6 +226,9 @@ def get_tw_total_ticker_count() -> int:
     return total_count
 
 
+_ALL_SMA_PERIODS = [2, 5, 10, 20, 30, 60, 120, 240]
+
+
 def add_technical_indicators(
     df: pd.DataFrame,
     bb_length: int,
@@ -190,11 +240,10 @@ def add_technical_indicators(
 
     result = df.copy()
 
-    # 既有均線欄位保留，避免前端線圖失效。
-    result["sma_5"] = result["close"].rolling(window=5, min_periods=5).mean()
-    result["sma_10"] = result["close"].rolling(window=10, min_periods=10).mean()
-    result["sma_20"] = result["close"].rolling(window=20, min_periods=20).mean()
-    result["sma_60"] = result["close"].rolling(window=60, min_periods=60).mean()
+    # 均線：若已從 DB 讀入（Path 1）則不重複計算；否則（Path 2/3）動態計算全部 8 条。
+    if "sma_5" not in result.columns:
+        for period in _ALL_SMA_PERIODS:
+            result[f"sma_{period}"] = result["close"].rolling(window=period, min_periods=period).mean()
 
     if ta is not None:
         bbands_df = ta.bbands(result["close"], length=bb_length, std=bb_std)
@@ -265,109 +314,119 @@ async def get_kline(
     sar_max: float = Query(default=0.2, gt=0),
     db: Session = Depends(get_db),
 ):
-    # 這個 API 的流程是：
-    # 1. 先用 ticker 去資料庫找是否已有歷史 K 線
-    # 2. 如果有，就直接回傳，速度最快
-    # 3. 如果沒有，才用 yfinance 抓資料
-    # 4. 抓到後寫進資料庫，下次同一支股票就可以直接從 DB 讀
+    # 流程：
+    # 1. 所有股票（含 ETF）→ 優先從 raw_kline_yfinance 讀取（有 adj_close，還原後顯示）
+    # 2. 找不到時 → 從 stock_kline 讀取（FinMind 原始資料，ETF 舊資料在此）
+    # 3. 兩張表都沒資料 → 即時呼叫 yfinance 並存入 raw_kline_yfinance
+    _CORE_COLS = ["open", "high", "low", "close", "volume"]
+
     try:
         ticker = normalize_ticker_symbol(ticker)
 
-        # 1. 先查 PostgreSQL
-        print("正在查詢資料庫...")
+        # --- 路徑 1：查詢 raw_kline_yfinance（所有股票、ETF 均適用）---
+        print(f"[kline] 查詢 raw_kline_yfinance：{ticker}")
+        yf_rows = (
+            db.query(RawKlineYFinance)
+            .filter(RawKlineYFinance.ticker == ticker)
+            .order_by(RawKlineYFinance.date.asc())
+            .all()
+        )
+        if yf_rows:
+            data = [to_chart_payload_from_yf(row) for row in yf_rows]
+            df = pd.DataFrame(data)
+            df.dropna(subset=_CORE_COLS, inplace=True)
+            if not df.empty:
+                df = add_technical_indicators(
+                    df,
+                    bb_length=bb_length,
+                    bb_std=bb_std,
+                    sar_step=sar_step,
+                    sar_max=sar_max,
+                )
+                print(f"[kline] {ticker} 從 raw_kline_yfinance 回傳 {len(df)} 筆")
+                return dataframe_to_json_records(df)
+
+        # --- 路徑 2：raw_kline_yfinance 無資料，查詢 stock_kline（FinMind 舊資料）---
+        print(f"[kline] 查詢 stock_kline：{ticker}")
         db_rows = (
             db.query(StockKline)
             .filter(StockKline.ticker == ticker)
             .order_by(StockKline.date.asc())
             .all()
         )
-        data = [to_chart_payload(row) for row in db_rows]
-        print(f"查詢完成，共 {len(data)} 筆")
         if db_rows:
+            data = [to_chart_payload(row) for row in db_rows]
             df = pd.DataFrame(data)
-            df.dropna(inplace=True)
-            if df.empty:
-                raise HTTPException(status_code=404, detail="資料清理後為空")
+            df.dropna(subset=_CORE_COLS, inplace=True)
+            if not df.empty:
+                df = add_technical_indicators(
+                    df,
+                    bb_length=bb_length,
+                    bb_std=bb_std,
+                    sar_step=sar_step,
+                    sar_max=sar_max,
+                )
+                print(f"[kline] {ticker} 從 stock_kline 回傳 {len(df)} 箆")
+                return dataframe_to_json_records(df)
 
-            df = add_technical_indicators(
-                df,
-                bb_length=bb_length,
-                bb_std=bb_std,
-                sar_step=sar_step,
-                sar_max=sar_max,
-            )
-            return dataframe_to_json_records(df)
-
-        # 2. DB 沒資料才抓 yfinance
-        # 明確保留原始 OHLC，並同時拿到調整後收盤價供分析用途。
-        df = yf.Ticker(ticker).history(period="6mo", auto_adjust=False, actions=True)
-        if df.empty:
+        # --- 路徑 3：DB 完全沒資料，即時從 yfinance 抓，存入 raw_kline_yfinance ---
+        print(f"[kline] DB 無資料，即時從 yfinance 抓取：{ticker}")
+        raw = yf.Ticker(ticker).history(period="6mo", auto_adjust=False, actions=True)
+        if raw is None or raw.empty:
             raise HTTPException(status_code=404, detail="找不到該股票資料")
 
-        # 3. 清理髒資料
-        # dropna 會刪掉有缺值的列，避免後面轉 float 或寫進 DB 時失敗。
-        df.dropna(inplace=True)
-        if df.empty:
-            raise HTTPException(status_code=404, detail="資料清理後為空")
+        raw.reset_index(inplace=True)
+        insert_rows: list[RawKlineYFinance] = []
+        response_data: list[dict] = []
+        fetched_at = datetime.now(timezone.utc)
 
-        # 4. 存入資料庫並組回傳格式
-        # yfinance 回來的 Date 常常在 index，所以先攤平成一般欄位。
-        df.reset_index(inplace=True)
-        rows_to_insert = []
-        response_data = []
-
-        for _, row in df.iterrows():
-            # 每次迴圈都把一列 dataframe 轉成：
-            # 1. 一筆要存進資料庫的 StockKline
-            # 2. 一筆要回傳給前端圖表的 dict
+        for _, row in raw.iterrows():
             row_date: date = row["Date"].date()
             open_price = float(row["Open"])
             high_price = float(row["High"])
             low_price = float(row["Low"])
             close_price = float(row["Close"])
-            adj_close_price = float(row.get("Adj Close", row["Close"]))
-            volume_value = float(row["Volume"])
-            adjustment_factor = adj_close_price / close_price if close_price else 1.0
-            adj_open_price = open_price * adjustment_factor
-            adj_high_price = high_price * adjustment_factor
-            adj_low_price = low_price * adjustment_factor
+            adj_close_price = float(row.get("Adj Close") or row["Close"])
+            volume_value = int(row["Volume"]) if not pd.isna(row["Volume"]) else 0
+            factor = adj_close_price / close_price if close_price else 1.0
 
-            model = StockKline(
-                ticker=ticker,
-                date=row_date,
-                open=open_price,
-                high=high_price,
-                low=low_price,
-                close=close_price,
-                adj_open=adj_open_price,
-                adj_high=adj_high_price,
-                adj_low=adj_low_price,
-                adj_close=adj_close_price,
-                volume=volume_value,
+            insert_rows.append(
+                RawKlineYFinance(
+                    ticker=ticker,
+                    date=row_date,
+                    open=open_price,
+                    high=high_price,
+                    low=low_price,
+                    close=close_price,
+                    adj_close=adj_close_price,
+                    volume=volume_value,
+                    dividends=float(row["Dividends"]) if "Dividends" in row and not pd.isna(row["Dividends"]) else 0.0,
+                    stock_splits=float(row["Stock Splits"]) if "Stock Splits" in row and not pd.isna(row["Stock Splits"]) else 0.0,
+                    fetched_at=fetched_at,
+                )
             )
-            rows_to_insert.append(model)
-
             response_data.append(
                 {
                     "time": row_date.strftime("%Y-%m-%d"),
-                    "open": open_price,
-                    "high": high_price,
-                    "low": low_price,
-                    "close": close_price,
-                    "adj_open": adj_open_price,
-                    "adj_high": adj_high_price,
-                    "adj_low": adj_low_price,
-                    "adj_close": adj_close_price,
+                    "open": round(open_price * factor, 4),
+                    "high": round(high_price * factor, 4),
+                    "low": round(low_price * factor, 4),
+                    "close": round(close_price * factor, 4),
+                    "adj_open": round(open_price * factor, 4),
+                    "adj_high": round(high_price * factor, 4),
+                    "adj_low": round(low_price * factor, 4),
+                    "adj_close": round(adj_close_price, 4),
                     "volume": volume_value,
                 }
             )
 
-        if rows_to_insert:
-            # add_all 是批次加入 session，commit 才會真的寫入 PostgreSQL。
-            db.add_all(rows_to_insert)
+        if insert_rows:
+            db.add_all(insert_rows)
             db.commit()
-
         response_df = pd.DataFrame(response_data)
+        response_df.dropna(subset=_CORE_COLS, inplace=True)
+        if response_df.empty:
+            raise HTTPException(status_code=404, detail="資料清理後為空")
         response_df = add_technical_indicators(
             response_df,
             bb_length=bb_length,
@@ -380,7 +439,6 @@ async def get_kline(
     except HTTPException:
         raise
     except Exception as e:
-        # 只要資料庫交易過程出錯，就 rollback，避免資料只寫一半。
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -468,6 +526,39 @@ async def get_financials(
         .all()
     )
 
+    # ── Quarterly financials from company_financials (EAV) ──────────────
+    QUARTERLY_METRICS = ["Basic EPS", "Diluted EPS", "Net Income", "Total Revenue"]
+    qf_rows = db.execute(
+        text(
+            """
+            SELECT report_date, metric, value
+            FROM company_financials
+            WHERE ticker = :code
+              AND metric = ANY(:metrics)
+            ORDER BY report_date DESC
+            LIMIT :lim
+            """
+        ),
+        {"code": code, "metrics": QUARTERLY_METRICS, "lim": limit * len(QUARTERLY_METRICS)},
+    ).fetchall()
+
+    # Pivot: group by report_date
+    from collections import defaultdict
+    qf_by_date: dict = defaultdict(dict)
+    for r in qf_rows:
+        qf_by_date[str(r.report_date)][r.metric] = r.value
+
+    quarterly_financials = [
+        {
+            "report_date": d,
+            "basic_eps": qf_by_date[d].get("Basic EPS"),
+            "diluted_eps": qf_by_date[d].get("Diluted EPS"),
+            "net_income": qf_by_date[d].get("Net Income"),
+            "total_revenue": qf_by_date[d].get("Total Revenue"),
+        }
+        for d in sorted(qf_by_date.keys(), reverse=True)[:limit]
+    ]
+
     return {
         "ticker": symbol,
         "report_links": build_report_links(symbol),
@@ -486,7 +577,94 @@ async def get_financials(
             }
             for row in rows
         ],
+        "quarterly_financials": quarterly_financials,
     }
+
+
+@app.get("/api/pe/{ticker}")
+async def get_pe_ratio(
+    ticker: str,
+    years: int = Query(default=10, ge=1, le=20),
+    db: Session = Depends(get_db),
+):
+    """
+    Return historical trailing-twelve-month (TTM) P/E ratio.
+    Joins stock_kline (close price, ticker with .TW suffix) with
+    company_financials Basic EPS (ticker without suffix, quarterly).
+    """
+    symbol = normalize_ticker_symbol(ticker)           # e.g. "2330.TW"
+    code = normalize_ticker_for_etf(symbol)             # e.g. "2330"
+
+    start_date = date.today() - timedelta(days=365 * years + 180)
+
+    # ── 1. Fetch quarterly Basic EPS ──────────────────────────────────────
+    eps_rows = db.execute(
+        text(
+            """
+            SELECT report_date, value
+            FROM company_financials
+            WHERE ticker = :code AND metric = 'Basic EPS'
+            ORDER BY report_date
+            """
+        ),
+        {"code": code},
+    ).fetchall()
+
+    if not eps_rows:
+        raise HTTPException(status_code=404, detail=f"No EPS data found for {code}")
+
+    # Build pandas Series for TTM rolling sum (4 quarters)
+    eps_df = pd.DataFrame(eps_rows, columns=["report_date", "eps"])
+    eps_df["report_date"] = pd.to_datetime(eps_df["report_date"])
+    eps_df = eps_df.sort_values("report_date").set_index("report_date")
+    # TTM EPS = sum of latest 4 quarters; forward-fill so every calendar day has a value
+    eps_series = eps_df["eps"]
+    ttm_series = eps_series.rolling(window=4, min_periods=4).sum()
+
+    # ── 2. Fetch daily close prices ───────────────────────────────────────
+    price_rows = db.execute(
+        text(
+            """
+            SELECT date, close
+            FROM stock_kline
+            WHERE ticker = :sym AND date >= :start
+            ORDER BY date
+            """
+        ),
+        {"sym": symbol, "start": start_date},
+    ).fetchall()
+
+    if not price_rows:
+        raise HTTPException(status_code=404, detail=f"No price data found for {symbol}")
+
+    price_df = pd.DataFrame(price_rows, columns=["date", "close"])
+    price_df["date"] = pd.to_datetime(price_df["date"])
+    price_df = price_df.set_index("date")
+
+    # ── 3. Align: for each trading day, find the most-recent TTM EPS ─────
+    # Reindex ttm_series to daily, forward-fill quarterly values
+    combined_idx = price_df.index.union(ttm_series.index)
+    ttm_daily = ttm_series.reindex(combined_idx).ffill()
+    ttm_on_price_dates = ttm_daily.reindex(price_df.index)
+
+    price_df["ttm_eps"] = ttm_on_price_dates.values
+    price_df = price_df.dropna(subset=["ttm_eps"])
+    price_df = price_df[price_df["ttm_eps"] != 0]
+    price_df["pe_ratio"] = price_df["close"] / price_df["ttm_eps"]
+    # Clip extreme values (negative EPS → skip; extremely high → likely data error)
+    price_df = price_df[price_df["ttm_eps"] > 0]
+
+    result = [
+        {
+            "date": row.Index.strftime("%Y-%m-%d"),
+            "close": round(float(row.close), 2),
+            "ttm_eps": round(float(row.ttm_eps), 4),
+            "pe_ratio": round(float(row.pe_ratio), 2),
+        }
+        for row in price_df.itertuples()
+    ]
+
+    return {"ticker": symbol, "data": result}
 
 
 @app.get("/api/data-integrity/coverage")

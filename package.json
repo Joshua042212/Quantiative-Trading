@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "start": "powershell -ExecutionPolicy Bypass -File ./start.ps1",
     "dev:up": "powershell -ExecutionPolicy Bypass -File ./start-dev.ps1",
     "crawl:all": "powershell -ExecutionPolicy Bypass -File ./start-full-crawl.ps1",
     "build": "tsc -b && vite build",

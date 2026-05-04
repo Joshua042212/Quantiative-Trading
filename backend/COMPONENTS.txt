@@ -1,0 +1,188 @@
+================================================================
+  台股資料系統 - 程式元件說明
+  更新日期：2026-05-01
+================================================================
+
+────────────────────────────────────────────────────────────────
+  後端核心 (backend/)
+────────────────────────────────────────────────────────────────
+
+main.py
+  FastAPI API 伺服器（port 8000）。
+  提供前端所需的所有 REST 端點：
+    GET /api/kline/{ticker}        - K 線資料（優先從 raw_kline_yfinance 取還原股價）
+    GET /api/financials/{ticker}   - 財報連結 + 最近 12 個月營收 + 最近 12 季財務摘要
+    GET /api/pe/{ticker}           - 歷史 TTM 本益比（trailing 4 季 EPS × 每日收盤價）
+    GET /api/news/{ticker}         - 個股新聞
+    GET /api/search                - 股票代號搜尋
+    GET /api/etf-premium-discount  - ETF 溢折價
+    GET /api/data-integrity/*      - 資料覆蓋率與異常紀錄
+  /api/financials/{ticker} 回傳結構：
+    report_links        - 外部報表連結（Goodinfo 月營收、季財報）
+    monthly_revenue     - 最近 12 個月營收（revenue_year/month/amount/mom_pct/yoy_pct）
+    quarterly_financials- 最近 12 季財報（report_date/basic_eps/diluted_eps/net_income/total_revenue）
+                          資料來源：company_financials（yfinance 季報，ticker 無 .TW 後綴）
+  /api/pe/{ticker}?years=N 回傳結構：
+    ticker              - 股票代碼
+    data[]              - {date, close, ttm_eps, pe_ratio} 每日序列
+    計算邏輯：Basic EPS 滾動 4 季加總 → TTM EPS；price / TTM EPS = P/E
+    ticker 對應規則：stock_kline 用 2330.TW；company_financials 用 2330
+  所有 K 線統一走三段邏輯：
+    Path 1: raw_kline_yfinance（有還原股價）→ 前端
+    Path 2: stock_kline（FinMind 舊資料，沒有還原股價）→ 前端
+    Path 3: yfinance 即時補抓（6 個月）→ 存入 raw_kline_yfinance → 前端
+
+models.py
+  SQLAlchemy ORM 模型定義（對應 PostgreSQL 各資料表）：
+    CompanyInfo           - 公司基本資料（代號、名稱、產業、市場、網站）
+    StockKline            - FinMind 原始日 K（無還原股價）
+    RawKlineYFinance      - yfinance 日 K（含還原股價 adj_close）
+    MonthlyRevenue        - 月營收（年月、營收額、月增%、年增%）
+    CompanyFinancials     - 公司季報財務指標
+    EtfPremiumDiscount    - ETF 溢折價
+
+database.py
+  資料庫連線設定。
+  從專案根目錄 .env 讀取 DATABASE_URL。
+  提供 SessionLocal、engine、Base 供其他模組使用。
+
+nightly_batch.py
+  批次作業的核心函式庫（不建議直接執行，請用 scheduled_tasks.py 或 data_crawler.py）。
+  主要函式：
+    sync_company_info_from_csv()  - 從 MOPSFIN + ISIN 同步公司清單（含 ETF）
+    sync_kline_history()          - FinMind + yfinance 全量 K 線下載
+    sync_yfinance_raw_only()      - 只補抓 raw_kline_yfinance 缺漏資料
+    fetch_and_store_yfinance_raw()- 單支股票 yfinance K 線下載並寫入 DB
+    sync_company_financials()     - yfinance 季報財務指標下載
+  包含 IP 封鎖自動等待重試機制（FinMind / yfinance 各 30 分鐘）。
+
+scheduled_tasks.py                                              [排程主入口]
+  每日自動排程腳本，由 Windows Task Scheduler 每天 20:00 呼叫。
+  根據當天日期自動決定執行哪些任務：
+    K 線增量更新    - 每天（補最近 N 天缺漏資料，預設 5 天）
+    月營收更新      - 每月 5~11 號
+    公司基本資料    - 每月 1 號
+    財報更新        - 3,4,5,6,8,9,11,12 月的 15 號
+  可調整常數（頂部 CONFIG 區塊）：
+    KLINE_BACKFILL_DAYS   - K 線增量補抓天數（預設 5）
+    REVENUE_DAYS          - 月營收執行日集合（預設 {5..11}）
+    FINANCIALS_MONTHS     - 財報執行月份集合（預設 {3,4,5,6,8,9,11,12}）
+    FINANCIALS_DAY        - 財報執行日（預設 15）
+    COMPANY_INFO_DAY      - 公司資料執行日（預設 1）
+  CLI 參數：
+    --backfill-days N     - 覆寫 K 線補抓天數（首次使用建議填 10）
+    --force-all           - 強制執行全部任務（測試用）
+    --task [kline|revenue|company-info|financials|sma|revenue-backfill] - 只跑單一任務
+  revenue-backfill 額外參數：
+    --backfill-months N          - 補抓最近 N 個月（以上個月為終點）
+    --backfill-from YYYY-MM      - 補抓起始年月
+    --backfill-to   YYYY-MM      - 補抓結束年月（預設：上個月）
+    --backfill-sleep-min SEC     - 請求間最小 sleep（預設 0.2）
+    --backfill-sleep-max SEC     - 請求間最大 sleep（預設 0.5）
+    --backfill-workers N         - FinMind 並發執行緒數（預設 10）
+  Log 自動儲存至 backend/logs/scheduled_YYYYMMDD.log
+
+monthly_revenue_crawler.py
+  月營收爬蟲。雙路徑並存：
+    路徑 A（最新月）：TWSE OpenAPI t187ap05_L/P，一次取全市場當月資料。
+    路徑 B（歷史補抓）：FinMind API TaiwanStockMonthRevenue，ThreadPoolExecutor
+                        多執行緒並發抓取（預設 10 workers），約 20~30 分鐘完成全市場。
+                        每個 worker 建立自己的 DataLoader() 實例，避免競態條件。
+                        FinMind 回傳單位為「元」，寫入 DB 前除以 1000（DB 存千元）。
+                        source 標記為 'finmind'。
+  crawl_monthly_revenue(year, month)
+      - 路徑 A：抓指定月份全市場月營收，source='twse_openapi'
+  crawl_monthly_revenue_backfill(start_year, start_month, end_year, end_month,
+                                  sleep_min, sleep_max, workers)
+      - 路徑 B：以 CompanyInfo 股票池為對象，ThreadPoolExecutor 並發補抓歷史
+      - FinMind date 欄位為「公告月」（= 營收月 + 1），需加一個月做日期轉換
+  CLI（單月抓取）:
+    python -m backend.monthly_revenue_crawler [--year Y --month M]
+  CLI（歷史補抓）:
+    python -m backend.monthly_revenue_crawler --backfill-months N
+    python -m backend.monthly_revenue_crawler --backfill-from YYYY-MM [--backfill-to YYYY-MM]
+    python -m backend.monthly_revenue_crawler --backfill-from 2016-01 --workers 10
+    python -m backend.monthly_revenue_crawler --backfill-from 2016-01 --tickers 2330,2454  ← 重跑特定股票
+  已驗證：2318 支股票 × 10 年 → 37,794 筆，約 20 分鐘完成
+
+news_crawler.py
+  個股新聞爬蟲，從 Yahoo Finance 抓取最近新聞標題與連結。
+  CLI: python -m backend.news_crawler [--tickers ...]
+
+etf_premium_discount_crawler.py
+  ETF 溢折價爬蟲，從 TWSE 取得 ETF 市價對 NAV 的溢折價百分比。
+
+data_validator.py
+  資料品質驗證器，標記異常 K 線（缺漏、價格跳空等）。
+
+────────────────────────────────────────────────────────────────
+  批次爬蟲入口 (backend/crawlers/)
+────────────────────────────────────────────────────────────────
+
+crawlers/data_crawler.py
+  整合爬蟲入口（手動觸發用）。
+  子指令：
+    company-info          - 只同步公司基本資料
+    hot-kline             - 只同步熱門 100 支 K 線
+    full-kline            - 全市場 K 線（跑很久）
+    nightly               - 完整夜間批次（公司資料 + K 線 + 財報）
+    monthly-revenue       - 月營收
+    news                  - 個股新聞
+
+────────────────────────────────────────────────────────────────
+  前端 (src/)
+────────────────────────────────────────────────────────────────
+
+src/main.tsx
+  React 應用程式入口，掛載 <App /> 到 #root。
+
+src/App.tsx
+  根元件，處理登入狀態，未登入顯示 LoginPage，已登入顯示 Dashboard。
+
+src/LoginPage.tsx
+  登入頁面元件。
+
+src/Dashboard.tsx
+  主儀表板，包含：
+    - K 線圖（TradingChart）
+    - 股票搜尋
+    - 新聞面板（側邊抽屜）
+    - ETF 溢折價面板（側邊抽屜）
+    - 報表／月營收面板（側邊抽屜）：
+        上半：季報財務摘要（最近 12 季）— Basic EPS、Diluted EPS、淨利、營收
+        下半：月營收表格（最近 12 個月）— 月增%、年增% 著色
+    - 本益比面板（側邊抽屜）：
+        統計卡片：目前 P/E、最低、平均、最高、歷史百分位
+        SVG 折線圖（10 年 TTM P/E 走勢）
+        最近 20 筆明細表
+
+src/TradingChart.tsx
+  K 線圖元件，使用 lightweight-charts 繪製蠟燭圖 + 技術指標。
+
+src/DataIntegrityDashboard.tsx
+  資料覆蓋率與異常紀錄儀表板。
+
+────────────────────────────────────────────────────────────────
+  設定與排程
+────────────────────────────────────────────────────────────────
+
+.env
+  環境變數（不進版控）：
+    DATABASE_URL          - PostgreSQL 連線字串
+    FINMIND_API_TOKEN     - FinMind API 金鑰
+
+start-dev.ps1
+  開發環境啟動腳本，同時開啟後端（uvicorn）與前端（vite）。
+
+setup_scheduler.ps1
+  Windows Task Scheduler 安裝腳本。
+  以系統管理員執行一次，即可建立每日 20:00 自動排程任務。
+  任務名稱：StockDB_DailyUpdate
+  執行指令：python backend/scheduled_tasks.py --backfill-days 5
+
+backend/logs/
+  執行日誌目錄：
+    nightly_failed_downloads.csv  - K 線/財報下載失敗紀錄
+    scheduled_YYYYMMDD.log        - 每日排程執行紀錄
+
+================================================================

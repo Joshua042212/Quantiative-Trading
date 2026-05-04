@@ -27,7 +27,7 @@ class StockKline(Base):
     adj_open = Column(Float, nullable=True)
     adj_high = Column(Float, nullable=True)
     adj_low = Column(Float, nullable=True)
-    adj_close = Column(Float, nullable=False)
+    adj_close = Column(Float, nullable=True)
     volume = Column(Float, nullable=False)
     is_verified = Column(Boolean, nullable=True)
     data_source = Column(String(64), nullable=True)
@@ -129,3 +129,36 @@ class CompanyFinancials(Base):
     value = Column(Float, nullable=True)
     source = Column(String(32), nullable=True)
     updated_at = Column(DateTime(timezone=True), nullable=True, index=True)
+
+
+class RawKlineYFinance(Base):
+    """yfinance 原始 K 線資料，保留未還原價格、Adj Close、除息與分割事件。
+
+    與 stock_kline（FinMind 來源）並存，供日後交叉比對驗證使用。
+    """
+
+    __tablename__ = "raw_kline_yfinance"
+    __table_args__ = (
+        UniqueConstraint("ticker", "date", name="uq_raw_yf_ticker_date"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    ticker = Column(String(32), nullable=False, index=True)
+    date = Column(Date, nullable=False, index=True)
+    open = Column(Float, nullable=True)
+    high = Column(Float, nullable=True)
+    low = Column(Float, nullable=True)
+    close = Column(Float, nullable=True)
+    adj_close = Column(Float, nullable=True)
+    volume = Column(BigInteger, nullable=True)
+    dividends = Column(Float, nullable=True)
+    stock_splits = Column(Float, nullable=True)
+    fetched_at = Column(DateTime(timezone=True), nullable=False)
+    sma_2 = Column(Float, nullable=True)
+    sma_5 = Column(Float, nullable=True)
+    sma_10 = Column(Float, nullable=True)
+    sma_20 = Column(Float, nullable=True)
+    sma_30 = Column(Float, nullable=True)
+    sma_60 = Column(Float, nullable=True)
+    sma_120 = Column(Float, nullable=True)
+    sma_240 = Column(Float, nullable=True)
