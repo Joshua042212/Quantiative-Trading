@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { apiUrl } from './api';
 
 interface CoverageData {
   downloaded_count: number;
@@ -25,8 +26,8 @@ const DataIntegrityDashboard: React.FC = () => {
     setIsLoading(true);
     try {
       const [coverageResp, unverifiedResp] = await Promise.all([
-        fetch('http://localhost:8000/api/data-integrity/coverage'),
-        fetch('http://localhost:8000/api/data-integrity/unverified?limit=300'),
+        fetch(apiUrl('/api/data-integrity/coverage')),
+        fetch(apiUrl('/api/data-integrity/unverified?limit=300')),
       ]);
 
       if (!coverageResp.ok) throw new Error(`coverage HTTP ${coverageResp.status}`);
@@ -50,7 +51,7 @@ const DataIntegrityDashboard: React.FC = () => {
     setIsRefetching(true);
     setRefetchMessage('重新抓取中...');
     try {
-      const response = await fetch('http://localhost:8000/api/data-integrity/refetch-unverified?limit=300', {
+      const response = await fetch(apiUrl('/api/data-integrity/refetch-unverified?limit=300'), {
         method: 'POST',
       });
       if (!response.ok) throw new Error(`refetch HTTP ${response.status}`);

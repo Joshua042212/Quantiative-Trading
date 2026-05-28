@@ -6,6 +6,7 @@ import {
   HistogramSeries,
   LineSeries,
 } from 'lightweight-charts';
+import { apiUrl } from './api';
 
 interface TradingChartProps {
   ticker: string;
@@ -311,7 +312,7 @@ const TradingChart: React.FC<TradingChartProps> = ({ ticker }) => {
           sar_step: String(normalizedParams.sarStep),
           sar_max: String(normalizedParams.sarMax),
         });
-        const response = await fetch(`http://localhost:8000/api/kline/${ticker}?${query.toString()}`);
+        const response = await fetch(apiUrl(`/api/kline/${ticker}?${query.toString()}`));
         if (!response.ok) {
           throw new Error(`HTTP error! status: ${response.status}`);
         }

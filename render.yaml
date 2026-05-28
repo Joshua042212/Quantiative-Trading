@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: quantiative-trading-api
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: FINMIND_API_TOKEN
+        sync: false
+      - key: FRONTEND_ORIGINS
+        sync: false

@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import TradingChart from './TradingChart.tsx';
+import { apiUrl } from './api';
 
 interface NewsItem {
   ticker: string;
@@ -178,7 +179,7 @@ const Dashboard: React.FC = () => {
     const fetchNews = async () => {
       setIsNewsLoading(true);
       try {
-        const response = await fetch(`http://localhost:8000/api/news/${ticker}?limit=30`);
+        const response = await fetch(apiUrl(`/api/news/${ticker}?limit=30`));
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
         const data: NewsItem[] = await response.json();
@@ -214,7 +215,7 @@ const Dashboard: React.FC = () => {
     const fetchEtfData = async () => {
       setIsEtfLoading(true);
       try {
-        const response = await fetch(`http://localhost:8000/api/etf-premium-discount/${ticker}?limit=20`);
+        const response = await fetch(apiUrl(`/api/etf-premium-discount/${ticker}?limit=20`));
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
         const data: EtfPremiumDiscountItem[] = await response.json();
@@ -244,7 +245,7 @@ const Dashboard: React.FC = () => {
     const fetchFinancials = async () => {
       setIsFinancialsLoading(true);
       try {
-        const response = await fetch(`http://localhost:8000/api/financials/${ticker}?limit=12`);
+        const response = await fetch(apiUrl(`/api/financials/${ticker}?limit=12`));
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
         const data: FinancialOverview = await response.json();
@@ -275,7 +276,7 @@ const Dashboard: React.FC = () => {
       setIsPeLoading(true);
       setPeError(null);
       try {
-        const response = await fetch(`http://localhost:8000/api/pe/${ticker}?years=10`);
+        const response = await fetch(apiUrl(`/api/pe/${ticker}?years=10`));
         if (!response.ok) {
           const body = await response.json().catch(() => ({}));
           throw new Error(body?.detail ?? `HTTP ${response.status}`);

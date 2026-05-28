@@ -1,5 +1,6 @@
 from datetime import date, datetime, timedelta, timezone
 from io import StringIO
+import os
 import re
 
 import numpy as np
@@ -55,14 +56,30 @@ _UNIVERSE_CACHE: dict[str, object] = {"count": None, "updated_at": None}
 
 app = FastAPI()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
+
+def get_allowed_origins() -> list[str]:
+    origins = [
         "http://localhost:5173",
         "http://localhost:5174",
         "http://127.0.0.1:5173",
         "http://127.0.0.1:5174",
-    ],
+    ]
+
+    # Accept comma-separated production frontend origins from environment.
+    extra_origins = os.getenv("FRONTEND_ORIGINS", "").strip()
+    single_origin = os.getenv("FRONTEND_ORIGIN", "").strip()
+    if single_origin:
+        extra_origins = f"{extra_origins},{single_origin}" if extra_origins else single_origin
+
+    for origin in [item.strip() for item in extra_origins.split(",") if item.strip()]:
+        if origin not in origins:
+            origins.append(origin)
+
+    return origins
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=get_allowed_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
