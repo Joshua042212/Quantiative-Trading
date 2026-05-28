@@ -139,7 +139,7 @@ powershell -ExecutionPolicy Bypass -File .\setup_scheduler.ps1
 5. 安裝前端套件：npm install。
 6. 啟動：npm run start。
 
-## GitHub 上傳前提醒
+提供台股資料蒐集、清洗、儲存與視覺化的一站式平台。
 
 - 機密設定請放在 .env（不要提交到 GitHub）
 - 專案請保留 .env.example 供他人快速設定
