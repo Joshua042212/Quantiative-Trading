@@ -252,7 +252,7 @@ const Dashboard: React.FC = () => {
       } catch (error) {
         if (!isCancelled) {
           console.error('Fetch financial data failed:', error);
-          setFinancialData({ ticker, report_links: [], monthly_revenue: [] });
+          setFinancialData({ ticker, report_links: [], monthly_revenue: [], quarterly_financials: [] });
         }
       } finally {
         if (!isCancelled) setIsFinancialsLoading(false);
