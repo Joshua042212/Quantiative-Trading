@@ -1,0 +1,15 @@
+# Backend Python files – not needed for Vercel frontend deployment.
+# The FastAPI backend is deployed separately (e.g. Render / Railway).
+backend/
+requirements.txt
+*.py
+.venv/
+check_financials.py
+check_output.txt
+setup_scheduler.ps1
+start-dev.ps1
+start.ps1
+start.bat
+start-dev.bat
+start-full-crawl.ps1
+start-full-crawl.bat
