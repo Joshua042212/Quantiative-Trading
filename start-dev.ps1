@@ -1,8 +1,32 @@
 $ErrorActionPreference = 'Stop'
 
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$backendCommand = "Set-Location '$projectRoot'; C:/Python314/python.exe -m uvicorn backend.main:app --reload --host localhost --port 8000"
-$frontendCommand = "Set-Location '$projectRoot'; npm run dev"
+
+# Resolve Python executable across common setups (.venv, py launcher, python in PATH).
+$pythonExe = $null
+$pythonArgs = @()
+
+if (Test-Path "$projectRoot\.venv\Scripts\python.exe") {
+  $pythonExe = "$projectRoot\.venv\Scripts\python.exe"
+} elseif ((Get-Command py -ErrorAction SilentlyContinue) -and (py -3 --version 2>$null)) {
+  $pythonExe = 'py'
+  $pythonArgs = @('-3')
+} elseif (Get-Command python -ErrorAction SilentlyContinue) {
+  $pythonExe = 'python'
+} else {
+  Write-Host 'ERROR: Could not find Python executable' -ForegroundColor Red
+  Write-Host 'Please install Python or create .venv first.' -ForegroundColor Red
+  exit 1
+}
+
+$backendCommand = "Set-Location '$projectRoot'; "
+if ($pythonArgs.Count -gt 0) {
+  $backendCommand += "& '$pythonExe' $($pythonArgs -join ' ') -m uvicorn backend.main:app --reload --host localhost --port 8000"
+} else {
+  $backendCommand += "& '$pythonExe' -m uvicorn backend.main:app --reload --host localhost --port 8000"
+}
+
+$frontendCommand = "Set-Location '$projectRoot'; npm.cmd run dev"
 
 Start-Process powershell -ArgumentList @(
   '-NoExit',
