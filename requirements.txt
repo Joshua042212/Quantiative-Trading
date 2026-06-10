@@ -43,7 +43,6 @@ nest-asyncio==1.6.0
 numpy==2.2.6
 packaging==26.1
 pandas==3.0.2
-pandas-ta==0.4.71b0
 parso==0.8.6
 peewee==4.0.4
 platformdirs==4.9.6
