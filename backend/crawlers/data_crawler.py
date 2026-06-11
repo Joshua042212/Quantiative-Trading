@@ -7,6 +7,8 @@ from __future__ import annotations
 """
 
 import argparse
+from datetime import date
+import random
 import sys
 import time
 from pathlib import Path
@@ -19,30 +21,159 @@ if str(BACKEND_DIR) not in sys.path:
 
 try:
     from ..database import SessionLocal
-    from ..full_market_crawler import crawl_once, fetch_and_store_ticker
-    from ..monthly_revenue_crawler import crawl_monthly_revenue
+    from ..monthly_revenue_crawler import crawl_monthly_revenue, crawl_monthly_revenue_backfill
     from ..news_crawler import run_news_crawler
-    from ..nightly_batch import ensure_runtime_schema, sync_company_financials, sync_company_info_from_csv, sync_kline_history
+    from ..batch_core import (
+        FINMIND_BAN_SLEEP_SECONDS,
+        YFINANCE_BAN_SLEEP_SECONDS,
+        FinMindIpBannedError,
+        YFinanceIpBannedError,
+        append_failed_download_log,
+        build_yfinance_symbol,
+        ensure_runtime_schema,
+        fetch_and_store_yfinance_raw,
+        fetch_finmind_history,
+        get_company_universe,
+        normalize_base_ticker,
+        sync_company_financials,
+        sync_company_info_from_csv,
+        sync_kline_history,
+        upsert_stock_history_rows,
+    )
 except ImportError:
     from database import SessionLocal
-    from full_market_crawler import crawl_once, fetch_and_store_ticker
-    from monthly_revenue_crawler import crawl_monthly_revenue
+    from monthly_revenue_crawler import crawl_monthly_revenue, crawl_monthly_revenue_backfill
     from news_crawler import run_news_crawler
-    from nightly_batch import ensure_runtime_schema, sync_company_financials, sync_company_info_from_csv, sync_kline_history
+    from batch_core import (
+        FINMIND_BAN_SLEEP_SECONDS,
+        YFINANCE_BAN_SLEEP_SECONDS,
+        FinMindIpBannedError,
+        YFinanceIpBannedError,
+        append_failed_download_log,
+        build_yfinance_symbol,
+        ensure_runtime_schema,
+        fetch_and_store_yfinance_raw,
+        fetch_finmind_history,
+        get_company_universe,
+        normalize_base_ticker,
+        sync_company_financials,
+        sync_company_info_from_csv,
+        sync_kline_history,
+        upsert_stock_history_rows,
+    )
 
 
 HOT_TICKERS = [
-    "2330.TW", "0050.TW", "2317.TW", "2454.TW", "2603.TW", "2881.TW", "2308.TW", "2303.TW", "2882.TW", "1303.TW",
-    "1301.TW", "2412.TW", "2891.TW", "2886.TW", "2884.TW", "2885.TW", "2880.TW", "2887.TW", "5880.TW", "2002.TW",
-    "3711.TW", "1216.TW", "1101.TW", "1102.TW", "1326.TW", "6505.TW", "2207.TW", "2327.TW", "2408.TW", "3034.TW",
-    "3008.TW", "2382.TW", "2357.TW", "2379.TW", "6669.TW", "3443.TW", "3037.TW", "3661.TW", "2353.TW", "2356.TW",
-    "2383.TW", "2883.TW", "2892.TW", "3045.TW", "3231.TW", "4904.TW", "2615.TW", "2618.TW", "2609.TW", "2610.TW",
-    "2645.TW", "5871.TW", "2888.TW", "6415.TW", "8046.TW", "2458.TW", "2376.TW", "3017.TW", "2409.TW", "4938.TW",
-    "2345.TW", "2404.TW", "5269.TW", "3529.TW", "1590.TW", "9910.TW", "9921.TW", "9945.TW", "2912.TW", "5876.TW",
-    "8454.TW", "2201.TW", "2385.TW", "1476.TW", "2834.TW", "6005.TW", "9904.TW", "9914.TW", "9933.TW", "2105.TW",
-    "2106.TW", "2606.TW", "2637.TW", "6770.TW", "1513.TW", "1504.TW", "1605.TW", "2377.TW", "2301.TW", "2347.TW",
-    "2474.TW", "3715.TW", "6531.TW", "2324.TW", "2371.TW", "2449.TW", "2607.TW", "4906.TW", "4935.TW", "4958.TW",
+    # ETF 只保留 0050 / 0052，避免首版折溢價資料源過多。
+    "0050.TW", "0052.TW",
+    # 補 20~30 檔高成交股票（首版先上核心權值與金融、航運、電子）。
+    "2330.TW", "2317.TW", "2454.TW", "2308.TW", "2303.TW", "2412.TW",
+    "2881.TW", "2882.TW", "2886.TW", "2884.TW", "2891.TW", "2885.TW", "2880.TW", "2883.TW", "2892.TW",
+    "2603.TW", "2609.TW", "2615.TW", "2618.TW",
+    "3037.TW", "3711.TW", "3231.TW", "2382.TW", "2357.TW", "2379.TW", "3045.TW",
+    "5880.TW", "2002.TW", "2207.TW", "6505.TW",
 ]
+
+FOCUS_STOCK_TICKERS = [ticker for ticker in HOT_TICKERS if not ticker.startswith("00")]
+
+
+def fetch_and_store_ticker(db, ticker: str, period: str = "10y") -> int:
+    """同步單一股票的 FinMind K 線與 yfinance 原始資料。"""
+    del period
+
+    raw_ticker = normalize_base_ticker(ticker)
+    market = None
+    if ticker.upper().endswith(".TW"):
+        market = "listed"
+    elif ticker.upper().endswith(".TWO"):
+        market = "otc"
+    yf_symbol = build_yfinance_symbol(raw_ticker, market)
+
+    while True:
+        try:
+            history = fetch_finmind_history(raw_ticker)
+            rows = []
+
+            for _, row in history.iterrows():
+                rows.append(
+                    {
+                        "ticker": yf_symbol,
+                        "date": row["date"],
+                        "open": float(row["open"]),
+                        "high": float(row["high"]),
+                        "low": float(row["low"]),
+                        "close": float(row["close"]),
+                        "adj_open": None,
+                        "adj_high": None,
+                        "adj_low": None,
+                        "adj_close": None,
+                        "volume": float(row.get("volume", 0.0) or 0.0),
+                        "is_verified": None,
+                        "data_source": "finmind",
+                        "error_tag": None,
+                        "has_anomaly": False,
+                        "anomaly_reason": None,
+                    }
+                )
+
+            written = upsert_stock_history_rows(db, rows)
+
+            while True:
+                try:
+                    yf_written = fetch_and_store_yfinance_raw(db, yf_symbol)
+                    print(f"[yf-raw] {yf_symbol} 寫入 {yf_written} 筆")
+                    break
+                except YFinanceIpBannedError as exc:
+                    print(f"[yf-raw][Warn] {exc}；自動暫停 {YFINANCE_BAN_SLEEP_SECONDS // 60} 分鐘後重試")
+                    append_failed_download_log("yfinance_raw_single_ip_ban", yf_symbol, exc)
+                    time.sleep(YFINANCE_BAN_SLEEP_SECONDS)
+                except Exception as exc:
+                    print(f"[yf-raw][Warn] {yf_symbol} yfinance 原始資料失敗，跳過：{exc}")
+                    append_failed_download_log("yfinance_raw_single", yf_symbol, exc)
+                    break
+
+            return written
+        except FinMindIpBannedError as exc:
+            db.rollback()
+            print(f"[K-line][Warn] {exc}；自動暫停 {FINMIND_BAN_SLEEP_SECONDS // 60} 分鐘後重試")
+            append_failed_download_log("finmind_single_ip_ban", yf_symbol, exc)
+            time.sleep(FINMIND_BAN_SLEEP_SECONDS)
+        except Exception:
+            db.rollback()
+            raise
+
+
+def crawl_once(period: str = "10y", min_delay: float = 1.0, max_delay: float = 3.0) -> int:
+    """同步目前公司池的全市場 K 線。"""
+    del period
+
+    ensure_runtime_schema()
+    db = SessionLocal()
+
+    try:
+        companies = get_company_universe(db)
+        total = len(companies)
+        total_rows = 0
+
+        for index, item in enumerate(companies, start=1):
+            raw_ticker = normalize_base_ticker(item["ticker"] or "")
+            market = item.get("market")
+            yf_symbol = build_yfinance_symbol(raw_ticker, market)
+            print(f"[Full K-line] ({index}/{total}) 下載 {yf_symbol}")
+
+            try:
+                total_rows += fetch_and_store_ticker(db, yf_symbol)
+            except Exception as exc:
+                db.rollback()
+                print(f"[Full K-line][Error] {yf_symbol} 下載失敗：{exc}")
+                append_failed_download_log("full_kline", yf_symbol, exc)
+
+            if max_delay > 0:
+                time.sleep(random.uniform(max(0.0, min_delay), max(min_delay, max_delay)))
+
+        return total_rows
+    finally:
+        db.close()
 
 
 def run_company_info_sync() -> int:
@@ -84,6 +215,35 @@ def run_hot_ticker_sync(period: str = "10y", delay_seconds: float = 5.0) -> int:
 def run_monthly_revenue_sync(year: int | None = None, month: int | None = None) -> None:
     """同步月營收資料。"""
     crawl_monthly_revenue(year, month)
+
+
+def run_focus_revenue_backfill(
+    months: int = 60,
+    sleep_min: float = 0.3,
+    sleep_max: float = 0.8,
+    workers: int = 8,
+) -> None:
+    """只補抓焦點股票池的歷史月營收（不含 ETF）。"""
+    today = date.today()
+    if today.month == 1:
+        end_year, end_month = today.year - 1, 12
+    else:
+        end_year, end_month = today.year, today.month - 1
+
+    total = end_year * 12 + end_month - (months - 1)
+    start_year = (total - 1) // 12
+    start_month = (total - 1) % 12 + 1
+
+    crawl_monthly_revenue_backfill(
+        start_year=start_year,
+        start_month=start_month,
+        end_year=end_year,
+        end_month=end_month,
+        sleep_min=sleep_min,
+        sleep_max=sleep_max,
+        workers=workers,
+        tickers_filter=FOCUS_STOCK_TICKERS,
+    )
 
 
 def run_news_sync(tickers: list[str] | None = None) -> None:
@@ -137,8 +297,8 @@ def main() -> None:
 
     subparsers.add_parser("company-info", help="同步公司基本資料")
 
-    hot_parser = subparsers.add_parser("hot-kline", help="同步熱門股票 K 線")
-    hot_parser.add_argument("--period", default="10y", help="yfinance history period，預設 10y")
+    hot_parser = subparsers.add_parser("hot-kline", help="同步焦點股票池 K 線（含 0050/0052）")
+    hot_parser.add_argument("--period", default="5y", help="yfinance history period，預設 5y")
     hot_parser.add_argument("--delay", type=float, default=5.0, help="每檔股票之間的等待秒數")
 
     full_parser = subparsers.add_parser("full-kline", help="同步全市場 K 線")
@@ -157,6 +317,12 @@ def main() -> None:
     revenue_parser = subparsers.add_parser("monthly-revenue", help="同步月營收資料")
     revenue_parser.add_argument("--year", type=int, default=None, help="西元年，例如 2026")
     revenue_parser.add_argument("--month", type=int, default=None, help="月份 1-12")
+
+    focus_revenue_parser = subparsers.add_parser("focus-revenue", help="只補抓焦點股票池月營收（不含 ETF）")
+    focus_revenue_parser.add_argument("--months", type=int, default=60, help="回補最近 N 個月，預設 60")
+    focus_revenue_parser.add_argument("--sleep-min", type=float, default=0.3, help="每檔請求最小 sleep 秒數")
+    focus_revenue_parser.add_argument("--sleep-max", type=float, default=0.8, help="每檔請求最大 sleep 秒數")
+    focus_revenue_parser.add_argument("--workers", type=int, default=8, help="並發 worker 數，預設 8")
 
     news_parser = subparsers.add_parser("news", help="同步個股新聞")
     news_parser.add_argument("--tickers", nargs="*", default=None, help="指定股票代號，例如 2330.TW 0050.TW")
@@ -189,6 +355,13 @@ def main() -> None:
         )
     elif args.command == "monthly-revenue":
         run_monthly_revenue_sync(year=args.year, month=args.month)
+    elif args.command == "focus-revenue":
+        run_focus_revenue_backfill(
+            months=args.months,
+            sleep_min=args.sleep_min,
+            sleep_max=args.sleep_max,
+            workers=args.workers,
+        )
     elif args.command == "news":
         run_news_sync(tickers=args.tickers)
 
