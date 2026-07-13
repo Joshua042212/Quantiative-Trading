@@ -52,6 +52,37 @@ ensure_runtime_schema()
 
 ISIN_URL = "https://isin.twse.com.tw/isin/C_public.jsp"
 _UNIVERSE_CACHE: dict[str, object] = {"count": None, "updated_at": None}
+_TABLE_NAME_CACHE: dict[str, str] = {}
+
+
+def resolve_table_name(db: Session, base_table: str) -> str:
+    """Resolve runtime table name with local-first defaults.
+
+    Default behavior prefers full base tables locally, and falls back to
+    *_focus tables when base tables are unavailable (e.g., Neon focus-only DB).
+    Set PREFER_FOCUS_TABLES=true to force focus-first resolution.
+    """
+    cached = _TABLE_NAME_CACHE.get(base_table)
+    if cached:
+        return cached
+
+    prefer_focus = os.getenv("PREFER_FOCUS_TABLES", "false").strip().lower() in {"1", "true", "yes", "on"}
+    if prefer_focus:
+        candidates = [f"{base_table}_focus", base_table]
+    else:
+        candidates = [base_table, f"{base_table}_focus"]
+
+    for candidate in candidates:
+        found = db.execute(
+            text("SELECT to_regclass(:table_name)"),
+            {"table_name": candidate},
+        ).scalar()
+        if found:
+            _TABLE_NAME_CACHE[base_table] = candidate
+            return candidate
+
+    # Keep behavior explicit if neither table exists.
+    raise HTTPException(status_code=500, detail=f"Table not found: {base_table} or {base_table}_focus")
 
 
 app = FastAPI()
@@ -340,16 +371,56 @@ async def get_kline(
     try:
         ticker = normalize_ticker_symbol(ticker)
 
-        # --- 路徑 1：查詢 raw_kline_yfinance（所有股票、ETF 均適用）---
-        print(f"[kline] 查詢 raw_kline_yfinance：{ticker}")
-        yf_rows = (
-            db.query(RawKlineYFinance)
-            .filter(RawKlineYFinance.ticker == ticker)
-            .order_by(RawKlineYFinance.date.asc())
-            .all()
-        )
+        # --- 路徑 1：查詢 raw_kline_yfinance(_focus)（所有股票、ETF 均適用）---
+        kline_table = resolve_table_name(db, "raw_kline_yfinance")
+        print(f"[kline] 查詢 {kline_table}：{ticker}")
+        yf_rows = db.execute(
+            text(
+                f"""
+                SELECT date, open, high, low, close, adj_close, volume,
+                       sma_2, sma_5, sma_10, sma_20, sma_30, sma_60, sma_120, sma_240
+                FROM {kline_table}
+                WHERE ticker = :ticker
+                ORDER BY date ASC
+                """
+            ),
+            {"ticker": ticker},
+        ).fetchall()
         if yf_rows:
-            data = [to_chart_payload_from_yf(row) for row in yf_rows]
+            data = []
+            for row in yf_rows:
+                close = row.close or 0.0
+                adj_close = row.adj_close
+                factor = (adj_close / close) if (close and adj_close is not None) else 1.0
+                if adj_close is None:
+                    adj_close = row.close
+
+                open_ = row.open or 0.0
+                high = row.high or 0.0
+                low = row.low or 0.0
+
+                data.append(
+                    {
+                        "time": row.date.strftime("%Y-%m-%d"),
+                        "open": round(open_ * factor, 4),
+                        "high": round(high * factor, 4),
+                        "low": round(low * factor, 4),
+                        "close": round(close * factor, 4),
+                        "adj_open": round(open_ * factor, 4),
+                        "adj_high": round(high * factor, 4),
+                        "adj_low": round(low * factor, 4),
+                        "adj_close": round(adj_close, 4) if adj_close is not None else None,
+                        "volume": row.volume,
+                        "sma_2": row.sma_2,
+                        "sma_5": row.sma_5,
+                        "sma_10": row.sma_10,
+                        "sma_20": row.sma_20,
+                        "sma_30": row.sma_30,
+                        "sma_60": row.sma_60,
+                        "sma_120": row.sma_120,
+                        "sma_240": row.sma_240,
+                    }
+                )
             df = pd.DataFrame(data)
             df.dropna(subset=_CORE_COLS, inplace=True)
             if not df.empty:
@@ -360,7 +431,7 @@ async def get_kline(
                     sar_step=sar_step,
                     sar_max=sar_max,
                 )
-                print(f"[kline] {ticker} 從 raw_kline_yfinance 回傳 {len(df)} 筆")
+                print(f"[kline] {ticker} 從 {kline_table} 回傳 {len(df)} 筆")
                 return dataframe_to_json_records(df)
 
         # --- 路徑 2：raw_kline_yfinance 無資料，查詢 stock_kline（FinMind 舊資料）---
@@ -530,26 +601,35 @@ async def get_financials(
     symbol = normalize_ticker_symbol(ticker)
     code = normalize_ticker_for_etf(ticker)
 
-    rows = (
-        db.query(MonthlyRevenue)
-        .filter(
-            (MonthlyRevenue.ticker == symbol)
-            | (MonthlyRevenue.ticker == f"{code}.TW")
-            | (MonthlyRevenue.ticker == f"{code}.TWO")
-            | (MonthlyRevenue.ticker == code)
-        )
-        .order_by(MonthlyRevenue.revenue_year.desc(), MonthlyRevenue.revenue_month.desc())
-        .limit(limit)
-        .all()
-    )
+    monthly_table = resolve_table_name(db, "monthly_revenue")
+    rows = db.execute(
+        text(
+            f"""
+            SELECT ticker, company_name, revenue_year, revenue_month, revenue_amount,
+                   previous_month_revenue, last_year_revenue, mom_pct, yoy_pct, source
+            FROM {monthly_table}
+            WHERE ticker IN (:symbol, :code_tw, :code_two, :code)
+            ORDER BY revenue_year DESC, revenue_month DESC
+            LIMIT :lim
+            """
+        ),
+        {
+            "symbol": symbol,
+            "code_tw": f"{code}.TW",
+            "code_two": f"{code}.TWO",
+            "code": code,
+            "lim": limit,
+        },
+    ).fetchall()
 
     # ── Quarterly financials from company_financials (EAV) ──────────────
     QUARTERLY_METRICS = ["Basic EPS", "Diluted EPS", "Net Income", "Total Revenue"]
+    financials_table = resolve_table_name(db, "company_financials")
     qf_rows = db.execute(
         text(
-            """
+            f"""
             SELECT report_date, metric, value
-            FROM company_financials
+            FROM {financials_table}
             WHERE ticker = :code
               AND metric = ANY(:metrics)
             ORDER BY report_date DESC
@@ -615,11 +695,12 @@ async def get_pe_ratio(
     start_date = date.today() - timedelta(days=365 * years + 180)
 
     # ── 1. Fetch quarterly Basic EPS ──────────────────────────────────────
+    financials_table = resolve_table_name(db, "company_financials")
     eps_rows = db.execute(
         text(
-            """
+            f"""
             SELECT report_date, value
-            FROM company_financials
+            FROM {financials_table}
             WHERE ticker = :code AND metric = 'Basic EPS'
             ORDER BY report_date
             """
