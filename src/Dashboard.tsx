@@ -129,10 +129,17 @@ const PeLineChart: React.FC<{ data: PeDataPoint[] }> = ({ data }) => {
 };
 
 
+const normalizeTickerInput = (value: string): string => {
+  const trimmed = value.trim().toUpperCase();
+  if (!trimmed) return '';
+  if (/^\d{4,6}$/.test(trimmed)) return `${trimmed}.TW`;
+  return trimmed;
+};
+
 const Dashboard: React.FC = () => {
   const navigate = useNavigate();
   const [ticker, setTicker] = useState('2330.TW');
-  const [inputValue, setInputValue] = useState('2330.TW');
+  const [inputValue, setInputValue] = useState('2330');
   const [isNewsOpen, setIsNewsOpen] = useState(false);
   const [isEtfOpen, setIsEtfOpen] = useState(false);
   const [isFinancialsOpen, setIsFinancialsOpen] = useState(false);
@@ -148,12 +155,16 @@ const Dashboard: React.FC = () => {
   const [peError, setPeError] = useState<string | null>(null);
 
   const handleLogout = () => {
+    localStorage.removeItem('stockAuth');
     navigate('/login');
   };
 
   const handleSearch = () => {
-    const trimmed = inputValue.trim();
-    if (trimmed) setTicker(trimmed);
+    const normalized = normalizeTickerInput(inputValue);
+    if (normalized) {
+      setInputValue(normalized);
+      setTicker(normalized);
+    }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -314,7 +325,7 @@ const Dashboard: React.FC = () => {
           value={inputValue}
           onChange={(e) => setInputValue(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder="輸入股票代碼，例如 2330.TW"
+          placeholder="輸入股票代碼，例如 2330"
           style={{
             padding: '8px 12px',
             fontSize: '14px',

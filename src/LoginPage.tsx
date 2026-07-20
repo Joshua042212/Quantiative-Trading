@@ -1,18 +1,39 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { CSSProperties, FC, FormEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
 
+const getStoredUsername = () => {
+  if (typeof window === 'undefined') return '';
+
+  try {
+    const stored = localStorage.getItem('stockAuth');
+    if (!stored) return '';
+    const parsed = JSON.parse(stored);
+    return typeof parsed?.username === 'string' ? parsed.username : '';
+  } catch {
+    return '';
+  }
+};
+
 const LoginPage: FC = () => {
-  const [username, setUsername] = useState('');
+  const [username, setUsername] = useState(getStoredUsername);
   const [password, setPassword] = useState('');
   const [errorMsg, setErrorMsg] = useState('');
   const navigate = useNavigate();
+
+  useEffect(() => {
+    const storedUsername = getStoredUsername();
+    if (storedUsername) {
+      setUsername(storedUsername);
+    }
+  }, []);
 
   const handleLogin = (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
 
     if (username === 'account' && password === 'password') {
       setErrorMsg('');
+      localStorage.setItem('stockAuth', JSON.stringify({ isLoggedIn: true, username }));
       navigate('/dashboard');
     } else {
       setErrorMsg('帳號或密碼錯誤，請重試！');

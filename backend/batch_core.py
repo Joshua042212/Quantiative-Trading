@@ -1,24 +1,19 @@
 from __future__ import annotations
 
-"""夜間批次核心邏輯。
+"""批次同步共用核心。
 
-這支程式主要負責三件事：
-1. 同步上市/上櫃/興櫃公司的基本資料。
-2. 補抓或刷新股票 K 線歷史資料。
-3. 下載公司財報欄位與官網網址。
-
-目前建議從 market_data_sync.py 啟動，這個檔案保留核心實作。
-註解以「資料來源 → 清洗 → 寫回資料庫」的流程來標示，方便後續除錯。
-目前建議從 backend/crawlers/data_crawler.py 啟動，這個檔案保留核心實作。
+集中提供公司資料、K 線、財報與相關輔助函式，
+讓排程腳本與手動爬蟲入口共用同一套實作。
 """
 
 import argparse
 import csv
+import math
 import os
 import random
 import re
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -704,6 +699,144 @@ def fetch_and_store_yfinance_raw(db: Session, yf_symbol: str) -> int:
         total_written += result.rowcount
 
     return total_written
+
+
+def sync_kline_incremental(
+    db: Session,
+    backfill_days: int,
+    log: Any | None = None,
+) -> dict[str, int]:
+    """增量同步 raw_kline_yfinance。
+
+    - 新股票：自 FINMIND_START_DATE 抓全量
+    - 舊股票：只補最近 backfill_days 天
+    回傳 {"success": x, "failed": y, "written": z, "total": n}。
+    """
+    companies = get_company_universe(db)
+
+    existing_yf: set[str] = {
+        row[0]
+        for row in db.execute(text("SELECT DISTINCT ticker FROM raw_kline_yfinance")).fetchall()
+        if row[0]
+    }
+
+    cutoff = (date.today() - timedelta(days=backfill_days)).isoformat()
+    total = len(companies)
+
+    if log:
+        log.info(f"[K線增量] 共 {total} 支，補抓 {backfill_days} 天（{cutoff} 之後），新股抓完整歷史")
+
+    success = 0
+    failed = 0
+    total_written = 0
+
+    def _sf(val):
+        try:
+            f = float(val)
+            return None if math.isnan(f) else f
+        except (TypeError, ValueError):
+            return None
+
+    def _si(val):
+        try:
+            f = float(val)
+            if math.isnan(f):
+                return None
+            return int(f)
+        except (TypeError, ValueError):
+            return None
+
+    for idx, item in enumerate(companies, start=1):
+        raw_ticker = normalize_base_ticker(item["ticker"] or "")
+        market = item.get("market")
+        yf_symbol = build_yfinance_symbol(raw_ticker, market)
+
+        is_new = yf_symbol not in existing_yf
+        start_date = FINMIND_START_DATE if is_new else cutoff
+
+        while True:
+            try:
+                raw = yf.download(
+                    yf_symbol,
+                    start=start_date,
+                    auto_adjust=False,
+                    actions=True,
+                    progress=False,
+                    threads=False,
+                )
+
+                if raw is None or raw.empty:
+                    if is_new and log:
+                        log.debug(f"[K線增量] {yf_symbol} 無資料（可能已下市），跳過")
+                    break
+
+                if isinstance(raw.columns, pd.MultiIndex):
+                    raw.columns = [col[0] for col in raw.columns]
+
+                fetched_at = datetime.now(tz=timezone.utc)
+                rows: list[dict[str, Any]] = []
+
+                for idx_date, row in raw.iterrows():
+                    rows.append(
+                        {
+                            "ticker": yf_symbol,
+                            "date": pd.Timestamp(idx_date).date(),
+                            "open": _sf(row.get("Open")),
+                            "high": _sf(row.get("High")),
+                            "low": _sf(row.get("Low")),
+                            "close": _sf(row.get("Close")),
+                            "adj_close": _sf(row.get("Adj Close")),
+                            "volume": _si(row.get("Volume")),
+                            "dividends": _sf(row.get("Dividends")),
+                            "stock_splits": _sf(row.get("Stock Splits")),
+                            "fetched_at": fetched_at,
+                        }
+                    )
+
+                if not rows:
+                    break
+
+                written = 0
+                chunk_size = 500
+                for offset in range(0, len(rows), chunk_size):
+                    chunk = rows[offset : offset + chunk_size]
+                    stmt = insert(RawKlineYFinance).values(chunk)
+                    stmt = stmt.on_conflict_do_nothing(constraint="uq_raw_yf_ticker_date")
+                    result = db.execute(stmt)
+                    db.commit()
+                    written += result.rowcount
+
+                total_written += written
+                if (written > 0 or is_new) and log:
+                    log.info(f"[K線增量] ({idx}/{total}) {yf_symbol} 寫入 {written} 筆")
+                success += 1
+                break
+            except Exception as exc:
+                exc_str = str(exc).lower()
+                if "429" in exc_str or "too many requests" in exc_str or "rate limit" in exc_str:
+                    if log:
+                        log.warning(
+                            f"[K線增量] yfinance 429，暫停 {YFINANCE_BAN_SLEEP_SECONDS // 60} 分鐘後重試 {yf_symbol}"
+                        )
+                    append_failed_download_log("kline_incremental_ip_ban", yf_symbol, exc)
+                    time.sleep(YFINANCE_BAN_SLEEP_SECONDS)
+                    continue
+
+                if log:
+                    log.warning(f"[K線增量] {yf_symbol} 失敗：{exc}")
+                append_failed_download_log("kline_incremental", yf_symbol, exc)
+                failed += 1
+                db.rollback()
+                break
+            finally:
+                time.sleep(random.uniform(0.3, 0.8))
+
+    return {
+        "success": success,
+        "failed": failed,
+        "written": total_written,
+        "total": total,
+    }
 
 
 def sync_kline_history(

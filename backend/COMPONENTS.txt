@@ -46,7 +46,7 @@ database.py
   從專案根目錄 .env 讀取 DATABASE_URL。
   提供 SessionLocal、engine、Base 供其他模組使用。
 
-nightly_batch.py
+batch_core.py
   批次作業的核心函式庫（不建議直接執行，請用 scheduled_tasks.py 或 data_crawler.py）。
   主要函式：
     sync_company_info_from_csv()  - 從 MOPSFIN + ISIN 同步公司清單（含 ETF）

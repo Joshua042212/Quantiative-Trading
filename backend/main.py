@@ -201,7 +201,10 @@ def to_chart_payload_from_yf(row: RawKlineYFinance) -> dict:
 
 
 def normalize_ticker_symbol(ticker: str) -> str:
-    return ticker.strip().upper()
+    raw = ticker.strip().upper()
+    if re.fullmatch(r"\d{4,6}", raw):
+        return f"{raw}.TW"
+    return raw
 
 
 def normalize_ticker_for_etf(ticker: str) -> str:

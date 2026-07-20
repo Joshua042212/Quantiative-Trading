@@ -17,12 +17,9 @@ from __future__ import annotations
 
 import argparse
 import logging
-import random
 import sys
-import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime
 from pathlib import Path
-from typing import Any
 
 # ────────────────────────────────────────────────────────────────
 #  可調整常數區：改這裡即可調整各任務的觸發頻率
@@ -43,9 +40,6 @@ FINANCIALS_MONTHS: set[int] = {3, 4, 5, 6, 8, 9, 11, 12}
 
 FINANCIALS_DAY: int = 15
 """財報月份中的第幾號執行。"""
-
-YFINANCE_BAN_SLEEP_SECONDS: int = 30 * 60
-"""yfinance 遇到 429 時暫停秒數（30 分鐘）。"""
 
 # ────────────────────────────────────────────────────────────────
 #  路徑設定
@@ -89,47 +83,25 @@ def setup_logging(today: date) -> logging.Logger:
 
 def _import_deps():
     """延遲 import 所有後端依賴，確保 sys.path 已設定完成。"""
-    import math
-
-    import yfinance as yf
-    from sqlalchemy.dialects.postgresql import insert
-
     from backend.database import SessionLocal
-    from backend.models import RawKlineYFinance
     from backend.monthly_revenue_crawler import crawl_monthly_revenue, crawl_monthly_revenue_backfill
-    from backend.nightly_batch import (
-        FINMIND_START_DATE,
-        YFinanceIpBannedError,
-        append_failed_download_log,
-        build_yfinance_symbol,
+    from backend.batch_core import (
         compute_and_store_sma,
         configure_finmind_auth,
         ensure_runtime_schema,
-        fetch_and_store_yfinance_raw,
-        get_company_universe,
-        normalize_base_ticker,
+        sync_kline_incremental,
         sync_company_financials,
         sync_company_info_from_csv,
     )
 
     return {
-        "math": math,
-        "yf": yf,
-        "insert": insert,
         "SessionLocal": SessionLocal,
-        "RawKlineYFinance": RawKlineYFinance,
         "crawl_monthly_revenue": crawl_monthly_revenue,
         "crawl_monthly_revenue_backfill": crawl_monthly_revenue_backfill,
-        "FINMIND_START_DATE": FINMIND_START_DATE,
-        "YFinanceIpBannedError": YFinanceIpBannedError,
-        "append_failed_download_log": append_failed_download_log,
-        "build_yfinance_symbol": build_yfinance_symbol,
         "compute_and_store_sma": compute_and_store_sma,
         "configure_finmind_auth": configure_finmind_auth,
         "ensure_runtime_schema": ensure_runtime_schema,
-        "fetch_and_store_yfinance_raw": fetch_and_store_yfinance_raw,
-        "get_company_universe": get_company_universe,
-        "normalize_base_ticker": normalize_base_ticker,
+        "sync_kline_incremental": sync_kline_incremental,
         "sync_company_financials": sync_company_financials,
         "sync_company_info_from_csv": sync_company_info_from_csv,
         "SessionLocal": SessionLocal,
@@ -150,136 +122,18 @@ def run_kline_incremental(backfill_days: int, log: logging.Logger) -> None:
     """
     deps = _import_deps()
     SessionLocal = deps["SessionLocal"]
-    RawKlineYFinance = deps["RawKlineYFinance"]
-    YFinanceIpBannedError = deps["YFinanceIpBannedError"]
-    append_failed_download_log = deps["append_failed_download_log"]
-    build_yfinance_symbol = deps["build_yfinance_symbol"]
     ensure_runtime_schema = deps["ensure_runtime_schema"]
-    fetch_and_store_yfinance_raw = deps["fetch_and_store_yfinance_raw"]
-    get_company_universe = deps["get_company_universe"]
-    normalize_base_ticker = deps["normalize_base_ticker"]
-    FINMIND_START_DATE = deps["FINMIND_START_DATE"]
-    insert = deps["insert"]
-
-    import yfinance as yf
-    import math
+    sync_kline_incremental = deps["sync_kline_incremental"]
 
     ensure_runtime_schema()
     db = SessionLocal()
 
     try:
-        companies = get_company_universe(db)
-
-        # 查詢已有資料的 ticker 集合
-        from sqlalchemy import text
-        existing_yf: set[str] = {
-            row[0]
-            for row in db.execute(text("SELECT DISTINCT ticker FROM raw_kline_yfinance")).fetchall()
-            if row[0]
-        }
-
-        cutoff = (date.today() - timedelta(days=backfill_days)).isoformat()
-        total = len(companies)
-        log.info(f"[K線增量] 共 {total} 支，補抓 {backfill_days} 天（{cutoff} 之後），新股抓完整歷史")
-
-        success = 0
-        failed = 0
-
-        for idx, item in enumerate(companies, start=1):
-            raw_ticker = normalize_base_ticker(item["ticker"] or "")
-            market = item.get("market")
-            yf_symbol = build_yfinance_symbol(raw_ticker, market)
-
-            is_new = yf_symbol not in existing_yf
-            start_date = FINMIND_START_DATE if is_new else cutoff
-
-            while True:
-                try:
-                    # 對於增量更新，直接用 yfinance 下載指定期間
-                    raw = yf.download(
-                        yf_symbol,
-                        start=start_date,
-                        auto_adjust=False,
-                        actions=True,
-                        progress=False,
-                        threads=False,
-                    )
-
-                    if raw is None or raw.empty:
-                        if is_new:
-                            log.debug(f"[K線增量] {yf_symbol} 無資料（可能已下市），跳過")
-                        break
-
-                    if isinstance(raw.columns, __import__("pandas").MultiIndex):
-                        raw.columns = [col[0] for col in raw.columns]
-
-                    fetched_at = datetime.now(tz=timezone.utc)
-
-                    def _sf(val):
-                        try:
-                            f = float(val)
-                            return None if math.isnan(f) else f
-                        except (TypeError, ValueError):
-                            return None
-
-                    def _si(val):
-                        try:
-                            f = float(val)
-                            if math.isnan(f):
-                                return None
-                            return int(f)
-                        except (TypeError, ValueError):
-                            return None
-
-                    rows: list[dict] = []
-                    for idx_date, row in raw.iterrows():
-                        rows.append({
-                            "ticker": yf_symbol,
-                            "date": __import__("pandas").Timestamp(idx_date).date(),
-                            "open": _sf(row.get("Open")),
-                            "high": _sf(row.get("High")),
-                            "low": _sf(row.get("Low")),
-                            "close": _sf(row.get("Close")),
-                            "adj_close": _sf(row.get("Adj Close")),
-                            "volume": _si(row.get("Volume")),
-                            "dividends": _sf(row.get("Dividends")),
-                            "stock_splits": _sf(row.get("Stock Splits")),
-                            "fetched_at": fetched_at,
-                        })
-
-                    if not rows:
-                        break
-
-                    chunk_size = 500
-                    written = 0
-                    for offset in range(0, len(rows), chunk_size):
-                        chunk = rows[offset:offset + chunk_size]
-                        stmt = insert(RawKlineYFinance).values(chunk)
-                        stmt = stmt.on_conflict_do_nothing(constraint="uq_raw_yf_ticker_date")
-                        result = db.execute(stmt)
-                        db.commit()
-                        written += result.rowcount
-
-                    if written > 0 or is_new:
-                        log.info(f"[K線增量] ({idx}/{total}) {yf_symbol} 寫入 {written} 筆")
-                    success += 1
-                    break
-
-                except Exception as exc:
-                    exc_str = str(exc).lower()
-                    if "429" in exc_str or "too many requests" in exc_str or "rate limit" in exc_str:
-                        log.warning(f"[K線增量] yfinance 429，暫停 {YFINANCE_BAN_SLEEP_SECONDS // 60} 分鐘後重試 {yf_symbol}")
-                        append_failed_download_log("kline_incremental_ip_ban", yf_symbol, exc)
-                        time.sleep(YFINANCE_BAN_SLEEP_SECONDS)
-                        continue
-                    log.warning(f"[K線增量] {yf_symbol} 失敗：{exc}")
-                    append_failed_download_log("kline_incremental", yf_symbol, exc)
-                    failed += 1
-                    break
-                finally:
-                    time.sleep(random.uniform(0.3, 0.8))
-
-        log.info(f"[K線增量] 完成。成功 {success}，失敗 {failed}")
+        summary = sync_kline_incremental(db, backfill_days=backfill_days, log=log)
+        log.info(
+            f"[K線增量] 完成。成功 {summary['success']}，失敗 {summary['failed']}，"
+            f"總寫入 {summary['written']} 筆"
+        )
 
     finally:
         db.close()
@@ -458,7 +312,7 @@ def main() -> None:
 
     # 嘗試 FinMind 登入（K 線增量用 yfinance，但萬一需要也備著）
     try:
-        from backend.nightly_batch import configure_finmind_auth
+        from backend.batch_core import configure_finmind_auth
         configure_finmind_auth()
     except Exception:
         pass

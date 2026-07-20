@@ -339,11 +339,11 @@ def crawl_monthly_revenue_backfill(
 
     # 延遲 import 避免循環相依
     try:
-        from .nightly_batch import get_company_universe
+        from .batch_core import get_company_universe
         from .database import SessionLocal
         from .models import MonthlyRevenue  # noqa: F401 (ensure table exists)
     except ImportError:
-        from nightly_batch import get_company_universe
+        from batch_core import get_company_universe
         from database import SessionLocal
         from models import MonthlyRevenue  # noqa: F401
 
